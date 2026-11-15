@@ -8,76 +8,91 @@
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
   <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body data-step="zone">
   <aside id="panel">
     <header>
       <h1>RunDraw</h1>
-      <p class="tagline">Dessine. Cours. La trace GPS fait le reste.</p>
+      <ol class="stepper" aria-label="Étapes">
+        <li data-for="zone"><button type="button" data-goto="zone">1 · Zone</button></li>
+        <li data-for="draw"><button type="button" data-goto="draw">2 · Dessin</button></li>
+        <li data-for="result"><button type="button" data-goto="result">3 · Parcours</button></li>
+      </ol>
     </header>
 
-    <form id="search" class="row">
-      <input id="search-q" type="search" placeholder="Ville, adresse…" aria-label="Rechercher un lieu">
-      <button type="submit" class="btn">Aller</button>
-      <button type="button" id="locate" class="btn icon" title="Ma position" aria-label="Ma position">◎</button>
-    </form>
-
-    <section>
-      <h2><span class="num">1</span> Choisis la zone</h2>
-      <p class="hint">Déplace et zoome la carte : le carré définit la zone du dessin.</p>
-      <p class="meta">Côté du carré : <strong id="zone-size">–</strong></p>
+    <!-- Étape 1 : zone -->
+    <section class="step" data-step="zone">
+      <form id="search" class="row">
+        <input id="search-q" type="search" placeholder="Ville, adresse…" aria-label="Rechercher un lieu">
+        <button type="submit" class="btn">Aller</button>
+        <button type="button" id="locate" class="btn icon" title="Ma position" aria-label="Ma position">◎</button>
+      </form>
+      <p class="hint">Déplace et zoome la carte pour placer le carré sur le quartier où tu veux courir.</p>
+      <p class="meta">Zone : <strong id="zone-size">–</strong> de côté</p>
+      <button type="button" id="to-draw" class="btn primary big">Dessiner dans cette zone →</button>
     </section>
 
-    <section id="draw-section">
-      <h2><span class="num">2</span> Dessine</h2>
-      <div class="segmented" role="group" aria-label="Mode">
-        <button type="button" id="mode-draw" class="seg active">✏️ Dessiner</button>
-        <button type="button" id="mode-pan" class="seg">✋ Carte</button>
-      </div>
+    <!-- Étape 2 : dessin -->
+    <section class="step" data-step="draw">
+      <p class="hint">Dessine dans le carré avec le doigt ou la souris. Chaque nouveau trait est relié au précédent.</p>
       <div class="row">
         <button type="button" id="undo" class="btn">↶ Annuler</button>
         <button type="button" id="clear" class="btn">Effacer</button>
-      </div>
-      <div class="row shapes">
-        <span class="meta">Formes :</span>
+        <span class="sep"></span>
         <button type="button" class="btn icon" data-shape="heart" title="Cœur">♥</button>
         <button type="button" class="btn icon" data-shape="star" title="Étoile">★</button>
         <button type="button" class="btn icon" data-shape="circle" title="Cercle">○</button>
         <button type="button" class="btn icon" data-shape="smiley" title="Smiley">☺</button>
       </div>
-      <p class="meta">Longueur du dessin : <strong id="draw-length">0 km</strong></p>
+      <div class="card">
+        <p class="meta">Distance estimée : <strong id="draw-length">–</strong></p>
+        <form id="target" class="row">
+          <label for="target-km" class="meta">Viser</label>
+          <input id="target-km" type="number" min="1" max="60" step="0.5" inputmode="decimal" placeholder="10">
+          <span class="meta">km</span>
+          <button type="submit" class="btn">Ajuster la taille</button>
+        </form>
+      </div>
+      <details>
+        <summary>Options</summary>
+        <label class="check"><input type="checkbox" id="opt-fit" checked> Tourner / décaler légèrement le dessin pour mieux suivre les rues</label>
+        <label class="check"><input type="checkbox" id="opt-connect" checked> Relier les traits en un seul parcours</label>
+      </details>
+      <p class="meta" id="prefetch"></p>
+      <button type="button" id="generate" class="btn primary big">Créer le parcours</button>
+      <button type="button" class="btn link" data-goto="zone">← Changer de zone</button>
     </section>
 
-    <section>
-      <h2><span class="num">3</span> Génère</h2>
-      <label class="check"><input type="checkbox" id="opt-fit" checked> Ajuster automatiquement (rotation, taille, position)</label>
-      <label class="check"><input type="checkbox" id="opt-connect" checked> Relier les traits en un seul parcours</label>
-      <label class="slider">Fidélité au dessin
-        <input type="range" id="opt-k" min="0.5" max="10" step="0.5" value="3">
-      </label>
-      <button type="button" id="generate" class="btn primary">Générer le parcours</button>
-      <p id="status" class="status" role="status"></p>
-    </section>
-
-    <section id="result" hidden>
-      <h2>Résultat</h2>
+    <!-- Étape 3 : résultat -->
+    <section class="step" data-step="result">
       <dl class="stats">
         <div><dt>Distance</dt><dd id="res-length">–</dd></div>
-        <div><dt>Écart moyen</dt><dd id="res-dev">–</dd></div>
+        <div><dt>Écart au dessin</dt><dd id="res-dev">–</dd></div>
       </dl>
+      <label class="slider">
+        <span class="slider-labels"><span>Plus court</span><span>Plus fidèle</span></span>
+        <input type="range" id="opt-k" min="0.5" max="10" step="0.5" value="3" aria-label="Fidélité au dessin">
+      </label>
       <p class="meta" id="res-fit"></p>
+      <button type="button" id="download" class="btn primary big">Télécharger le GPX</button>
       <div class="row">
-        <button type="button" id="download" class="btn primary">Télécharger le GPX</button>
-        <button type="button" id="edit" class="btn">Modifier</button>
+        <button type="button" class="btn" data-goto="draw">✏️ Retoucher le dessin</button>
+        <button type="button" class="btn" data-goto="zone">Nouvelle zone</button>
       </div>
       <p class="legend"><span class="sw route"></span> parcours <span class="sw link"></span> liaison <span class="sw ghost"></span> dessin</p>
     </section>
 
-    <footer>Données © contributeurs <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>. Vérifie toujours le parcours avant de courir.</footer>
+    <p id="status" class="status" role="status"></p>
+    <footer>Données © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">contributeurs OpenStreetMap</a>. Vérifie le parcours avant de courir.</footer>
   </aside>
 
   <main id="map-wrap">
     <div id="map"></div>
     <div id="stencil"><canvas id="canvas"></canvas></div>
+    <div id="busy" hidden>
+      <div class="spinner" aria-hidden="true"></div>
+      <div><strong id="busy-text">Chargement…</strong><span id="busy-sub"></span></div>
+      <button type="button" id="cancel" class="btn">Annuler</button>
+    </div>
   </main>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>

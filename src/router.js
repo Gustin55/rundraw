@@ -193,7 +193,7 @@ function placementScore(index, strokes, cap) {
  * qui colle mieux au réseau local. Renvoie les traits transformés.
  */
 export function autoFit(index, strokes, tol, { maxScale = 0.2, maxRot = 20, maxShift = 0.12 } = {}) {
-  const samples = strokes.map((p) => resample(p, Math.max(tol / 2, 5)));
+  const samples = strokes.map((p) => resample(p, Math.max(tol, 8)));
   const bb = bboxOf(strokes);
   const c = [(bb.minX + bb.maxX) / 2, (bb.minY + bb.maxY) / 2];
   const size = Math.max(bb.maxX - bb.minX, bb.maxY - bb.minY);
@@ -242,7 +242,7 @@ export function deviation(routeLines, strokes) {
  * Pipeline complet : traits en mètres → parcours.
  * Renvoie { parts: [{ type: 'stroke'|'link', nodes }], length, deviation, fit }
  */
-export function planRoute(graph, index, strokesXY, { tolerance, K = 3, fit = true, connect = true } = {}) {
+export function planRoute(graph, index, strokesXY, { tolerance, K = 3, fit = true, fitMaxScale = 0.15, connect = true } = {}) {
   const router = new Router(graph, index);
   const bb = bboxOf(strokesXY);
   const size = Math.hypot(bb.maxX - bb.minX, bb.maxY - bb.minY);
@@ -250,7 +250,7 @@ export function planRoute(graph, index, strokesXY, { tolerance, K = 3, fit = tru
   let strokes = strokesXY.filter((p) => p.length >= 2);
   let fitInfo = null;
   if (fit) {
-    const f = autoFit(index, strokes, tol);
+    const f = autoFit(index, strokes, tol, { maxScale: fitMaxScale, maxRot: 12 });
     strokes = f.strokes;
     fitInfo = f;
   }

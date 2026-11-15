@@ -1,49 +1,55 @@
-// Interface : carte Leaflet, carré de dessin, génération et export.
+// Interface : parcours guidé en 3 étapes (zone → dessin → parcours).
 
-import { makeProjection, polylineLength } from './geo.js';
-import { buildGraph, SpatialIndex } from './graph.js';
-import { planRoute } from './router.js';
+import { polylineLength } from './geo.js';
+import { fetchStreets } from './osm.js';
 import { toGPX } from './gpx.js';
 import { SHAPES } from './shapes.js';
 
 const L = window.L;
 const $ = (id) => document.getElementById(id);
-
-const OVERPASS = [
-  'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
-  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
-];
 const MAX_SIDE_M = 6000;
+const MIN_SIDE_M = 300;
+const ROUTE_FACTOR = 1.15; // un parcours sur rues est en général un peu plus long que le dessin
+const PAD = 0.12;          // marge autour du carré pour les rues téléchargées
+
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('rundraw:' + k); return v ? JSON.parse(v) : d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('rundraw:' + k, JSON.stringify(v)); } catch { /* ignore */ } },
+};
+const fmtKm = (m) => (m >= 1000 ? (m / 1000).toFixed(m >= 10000 ? 1 : 2).replace('.', ',') + ' km' : Math.round(m) + ' m');
+const fmtMo = (b) => (b / 1048576).toFixed(1).replace('.', ',') + ' Mo';
 
 // ---------- Carte ----------
-let view = { lat: 48.8566, lon: 2.3522, z: 15 };
-try { view = JSON.parse(localStorage.getItem('rundraw:view')) || view; } catch { /* stockage indisponible */ }
-
-const map = L.map('map', { zoomControl: true }).setView([view.lat, view.lon], view.z);
+const view = store.get('view', { lat: 48.8566, lon: 2.3522, z: 15 });
+const map = L.map('map', { zoomSnap: 0, zoomDelta: 0.5, wheelPxPerZoomLevel: 120 }).setView([view.lat, view.lon], view.z);
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19,
   attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
 }).addTo(map);
 const resultLayer = L.layerGroup().addTo(map);
 
-map.on('moveend', () => {
-  const c = map.getCenter();
-  try { localStorage.setItem('rundraw:view', JSON.stringify({ lat: c.lat, lon: c.lng, z: map.getZoom() })); } catch { /* ignore */ }
+map.on('moveend zoomend', () => {
+  if (step === 'zone') {
+    const c = map.getCenter();
+    store.set('view', { lat: c.lat, lon: c.lng, z: map.getZoom() });
+  }
   updateZoneInfo();
 });
-map.on('zoomend', updateZoneInfo);
+
+const handlers = ['dragging', 'touchZoom', 'scrollWheelZoom', 'doubleClickZoom', 'boxZoom', 'keyboard'];
+const lockMap = (locked) => handlers.forEach((h) => map[h] && (locked ? map[h].disable() : map[h].enable()));
 
 // ---------- Carré de dessin ----------
 const wrap = $('map-wrap'), stencil = $('stencil'), canvas = $('canvas');
 const ctx = canvas.getContext('2d');
 let box = { left: 0, top: 0, side: 0 };
-let strokes = []; // traits en coordonnées normalisées [0,1]
+let strokes = store.get('strokes', []); // en coordonnées normalisées [0,1] dans le carré
+let history = [];
 let current = null;
 
 function layoutStencil() {
   const w = wrap.clientWidth, h = wrap.clientHeight;
-  const side = Math.round(Math.min(w, h) * 0.78);
+  const side = Math.round(Math.min(w, h) * 0.82);
   box = { left: Math.round((w - side) / 2), top: Math.round((h - side) / 2), side };
   Object.assign(stencil.style, { left: box.left + 'px', top: box.top + 'px', width: side + 'px', height: side + 'px' });
   const dpr = window.devicePixelRatio || 1;
@@ -58,7 +64,7 @@ function redraw() {
   ctx.clearRect(0, 0, box.side, box.side);
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-  ctx.lineWidth = 4;
+  ctx.lineWidth = 5;
   ctx.strokeStyle = '#1c7ed6';
   for (const s of strokes) {
     if (s.length < 2) continue;
@@ -67,10 +73,16 @@ function redraw() {
     for (const [u, v] of s) ctx.lineTo(u * box.side, v * box.side);
     ctx.stroke();
   }
-  ctx.fillStyle = '#e8590c';
-  for (const s of strokes) if (s.length) {
+  if (!strokes.length && step === 'draw') {
+    ctx.fillStyle = 'rgba(0,0,0,.45)';
+    ctx.font = '600 16px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Dessine ici', box.side / 2, box.side / 2);
+  }
+  ctx.fillStyle = '#2b8a3e';
+  if (strokes[0]?.length) {
     ctx.beginPath();
-    ctx.arc(s[0][0] * box.side, s[0][1] * box.side, 5, 0, Math.PI * 2);
+    ctx.arc(strokes[0][0][0] * box.side, strokes[0][0][1] * box.side, 6, 0, Math.PI * 2);
     ctx.fill();
   }
   updateDrawLength();
@@ -78,32 +90,36 @@ function redraw() {
 
 function zoneSideMeters() {
   const y = box.top + box.side / 2;
-  const a = map.containerPointToLatLng([box.left, y]);
-  const b = map.containerPointToLatLng([box.left + box.side, y]);
-  return map.distance(a, b);
+  return map.distance(map.containerPointToLatLng([box.left, y]), map.containerPointToLatLng([box.left + box.side, y]));
 }
-const fmtKm = (m) => (m >= 1000 ? (m / 1000).toFixed(m >= 10000 ? 1 : 2) + ' km' : Math.round(m) + ' m');
+const drawLengthMeters = () => strokes.reduce((s, p) => s + polylineLength(p), 0) * zoneSideMeters();
 
 function updateZoneInfo() {
   if (!box.side) return;
   const m = zoneSideMeters();
-  $('zone-size').textContent = fmtKm(m) + (m > MAX_SIDE_M ? ' (trop grand, zoome)' : '');
+  $('zone-size').textContent = fmtKm(m);
+  const tooBig = m > MAX_SIDE_M, tooSmall = m < MIN_SIDE_M;
+  $('to-draw').disabled = tooBig || tooSmall;
+  $('to-draw').textContent = tooBig ? `Zone trop grande : zoome (max ${MAX_SIDE_M / 1000} km)` : tooSmall ? 'Zone trop petite : dézoome' : 'Dessiner dans cette zone →';
   updateDrawLength();
 }
 function updateDrawLength() {
   if (!box.side) return;
-  const m = zoneSideMeters();
-  const len = strokes.reduce((s, p) => s + polylineLength(p), 0) * m;
-  $('draw-length').textContent = '≈ ' + fmtKm(len);
+  const len = drawLengthMeters();
+  $('draw-length').textContent = len ? '≈ ' + fmtKm(len * ROUTE_FACTOR) : '–';
 }
+
+const saveStrokes = () => store.set('strokes', strokes);
+const pushHistory = () => { history.push(JSON.stringify(strokes)); if (history.length > 50) history.shift(); };
 
 const toNorm = (e) => {
   const r = stencil.getBoundingClientRect();
   return [Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), Math.min(1, Math.max(0, (e.clientY - r.top) / r.height))];
 };
 stencil.addEventListener('pointerdown', (e) => {
-  if (!stencil.classList.contains('drawing')) return;
+  if (step !== 'draw') return;
   stencil.setPointerCapture(e.pointerId);
+  pushHistory();
   current = [toNorm(e)];
   strokes.push(current);
   e.preventDefault();
@@ -111,33 +127,78 @@ stencil.addEventListener('pointerdown', (e) => {
 stencil.addEventListener('pointermove', (e) => {
   if (!current) return;
   const p = toNorm(e), q = current[current.length - 1];
-  if (Math.hypot(p[0] - q[0], p[1] - q[1]) * box.side < 2) return;
+  if (Math.hypot(p[0] - q[0], p[1] - q[1]) * box.side < 3) return;
   current.push(p);
   redraw();
 });
 const endStroke = () => {
-  if (current && current.length < 2) strokes.pop();
+  if (!current) return;
+  if (current.length < 2) { strokes.pop(); history.pop(); }
+  else {
+    // Léger lissage du tremblement de la main (extrémités conservées).
+    const s = current;
+    for (let pass = 0; pass < 2; pass++)
+      for (let i = 1; i < s.length - 1; i++)
+        s[i] = [(s[i - 1][0] + 2 * s[i][0] + s[i + 1][0]) / 4, (s[i - 1][1] + 2 * s[i][1] + s[i + 1][1]) / 4];
+  }
   current = null;
+  saveStrokes();
   redraw();
 };
 stencil.addEventListener('pointerup', endStroke);
 stencil.addEventListener('pointercancel', endStroke);
 
-function setMode(draw) {
-  stencil.classList.toggle('drawing', draw);
-  $('mode-draw').classList.toggle('active', draw);
-  $('mode-pan').classList.toggle('active', !draw);
-}
-$('mode-draw').onclick = () => setMode(true);
-$('mode-pan').onclick = () => setMode(false);
-$('undo').onclick = () => { strokes.pop(); redraw(); };
-$('clear').onclick = () => { strokes = []; redraw(); };
+const undo = () => { if (history.length) { strokes = JSON.parse(history.pop()); saveStrokes(); redraw(); } };
+$('undo').onclick = undo;
+$('clear').onclick = () => { if (strokes.length) { pushHistory(); strokes = []; saveStrokes(); redraw(); } };
 document.querySelectorAll('[data-shape]').forEach((b) => {
-  b.onclick = () => { strokes = SHAPES[b.dataset.shape](); redraw(); };
+  b.onclick = () => { pushHistory(); strokes = SHAPES[b.dataset.shape](); saveStrokes(); redraw(); };
 });
-window.addEventListener('resize', layoutStencil);
-layoutStencil();
-setMode(true);
+document.addEventListener('keydown', (e) => {
+  if (step === 'draw' && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); }
+});
+let lastWrap = '';
+new ResizeObserver(() => {
+  const k = wrap.clientWidth + 'x' + wrap.clientHeight;
+  if (k === lastWrap) return;
+  lastWrap = k;
+  map.invalidateSize({ animate: false });
+  layoutStencil();
+  if (step === 'draw') restartPrefetch();
+}).observe(wrap);
+
+// ---------- Étapes ----------
+let step = 'zone';
+let zoneView = null;
+let lastResult = null;
+
+function goStep(next) {
+  if (next === 'result' && !lastResult) return;
+  if (next === 'draw' && step === 'zone') {
+    if (zoneSideMeters() > MAX_SIDE_M || zoneSideMeters() < MIN_SIDE_M) return;
+    zoneView = { center: map.getCenter(), zoom: map.getZoom() };
+  }
+  if (next === 'draw' && zoneView && step === 'result') map.setView(zoneView.center, zoneView.zoom, { animate: false });
+  if (next !== 'result') resultLayer.clearLayers();
+  if (next === 'result' && lastResult) drawResult(lastResult);
+  step = next;
+  document.body.dataset.step = next;
+  lockMap(next === 'draw');
+  $('stepper-result').disabled = !lastResult;
+  setStatus('');
+  if (next === 'draw') ensureStreets().catch(() => {});
+  if (next === 'zone') cancelStreets();
+  redraw();
+}
+document.querySelectorAll('[data-goto]').forEach((b) => (b.onclick = () => goStep(b.dataset.goto)));
+document.querySelector('[data-goto="result"]').id = 'stepper-result';
+$('to-draw').onclick = () => goStep('draw');
+
+function setStatus(msg, error = false) {
+  const el = $('status');
+  el.textContent = msg;
+  el.classList.toggle('error', error);
+}
 
 // ---------- Recherche / position ----------
 $('search').addEventListener('submit', async (e) => {
@@ -156,145 +217,215 @@ $('search').addEventListener('submit', async (e) => {
   }
 });
 $('locate').onclick = () => {
-  map.locate({ setView: true, maxZoom: 16 });
+  setStatus('Localisation…');
+  map.locate({ setView: true, maxZoom: 15 });
+  map.once('locationfound', () => setStatus(''));
   map.once('locationerror', () => setStatus('Position indisponible.', true));
 };
 
-// ---------- Données OSM ----------
-const osmCache = new Map();
-async function fetchStreets(s, w, n, e) {
-  const key = [s, w, n, e].map((v) => v.toFixed(4)).join(',');
-  if (osmCache.has(key)) return osmCache.get(key);
-  const bbox = `${s},${w},${n},${e}`;
-  const query = `[out:json][timeout:60];
-way["highway"]["highway"!~"^(motorway|motorway_link|trunk|trunk_link|construction|proposed|raceway|bus_guideway|escape|abandoned|platform|corridor|elevator|busway)$"]["access"!~"^(private|no)$"]["foot"!~"^(no|private)$"]["area"!="yes"](${bbox});
-(._;>;);
-out skel qt;`;
-  let lastErr;
-  for (const url of OVERPASS) {
-    try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 70000);
-      const r = await fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(query), headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, signal: ctrl.signal });
-      clearTimeout(timer);
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      const json = await r.json();
-      osmCache.set(key, json);
-      return json;
-    } catch (err) {
-      lastErr = err;
-    }
-  }
-  throw lastErr;
+// ---------- Calcul en arrière-plan ----------
+let worker, workerKey = null, pending = null;
+function startWorker() {
+  worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+  workerKey = null;
+  worker.onmessage = (e) => {
+    const m = e.data;
+    if (m.type === 'progress') return setBusy(null, m.text);
+    const p = pending;
+    pending = null;
+    if (!p) return;
+    if (m.type === 'error') p.reject(new Error(m.message));
+    else p.resolve(m);
+  };
+  worker.onerror = (e) => { if (pending) { pending.reject(new Error(e.message || 'Erreur de calcul')); pending = null; } };
 }
+startWorker();
+const callWorker = (msg) => new Promise((resolve, reject) => { pending = { resolve, reject }; worker.postMessage(msg); });
+
+// ---------- Rues (préchargées dès l'entrée dans l'étape dessin) ----------
+let streets = null; // { bboxKey, promise, ctrl, label }
+
+function currentZone() {
+  const nw = map.containerPointToLatLng([box.left, box.top]);
+  const se = map.containerPointToLatLng([box.left + box.side, box.top + box.side]);
+  const c = map.containerPointToLatLng([box.left + box.side / 2, box.top + box.side / 2]);
+  const pLat = (nw.lat - se.lat) * PAD, pLon = (se.lng - nw.lng) * PAD;
+  const bbox = [se.lat - pLat, nw.lng - pLon, nw.lat + pLat, se.lng + pLon];
+  return { bbox, bboxKey: bbox.map((v) => v.toFixed(4)).join(','), center: [c.lat, c.lng] };
+}
+
+function setPrefetch(text) { $('prefetch').textContent = text; streets && (streets.label = text); }
+
+function ensureStreets() {
+  const z = currentZone();
+  if (streets && streets.bboxKey === z.bboxKey) return streets.promise;
+  cancelStreets();
+  const ctrl = new AbortController();
+  const job = { bboxKey: z.bboxKey, ctrl, label: '' };
+  streets = job;
+  setPrefetch('Rues : connexion à OpenStreetMap…');
+  job.promise = (async () => {
+    const t0 = performance.now();
+    const { key, text } = await fetchStreets(z.bbox, {
+      signal: ctrl.signal,
+      onStatus: (s) => {
+        if (streets !== job) return;
+        const t = s.phase === 'cache' ? 'Rues : en cache ✓'
+          : s.phase === 'download' ? `Rues : téléchargement ${fmtMo(s.bytes)}…`
+          : `Rues : en attente du serveur${s.servers > 1 ? ` (essai ${s.servers})` : ''}…`;
+        setPrefetch(t);
+        setBusy(null, t.replace('Rues : ', ''));
+      },
+    });
+    if (ctrl.signal.aborted) throw new DOMException('Annulé', 'AbortError');
+    if (workerKey !== key) {
+      const m = await callWorker({ type: 'load', key, osmText: text, center: z.center });
+      workerKey = key;
+      if (streets === job) setPrefetch(`Rues prêtes ✓ (${m.nodes.toLocaleString('fr')} points, ${((performance.now() - t0) / 1000).toFixed(1)} s)`);
+    }
+    return key;
+  })();
+  job.promise.catch((err) => {
+    if (streets !== job || err.name === 'AbortError') return;
+    setPrefetch('Rues : ' + err.message);
+    streets = null; // permettra de réessayer
+  });
+  return job.promise;
+}
+function cancelStreets() {
+  if (streets) streets.ctrl.abort();
+  streets = null;
+  $('prefetch').textContent = '';
+}
+let prefetchTimer;
+function restartPrefetch() {
+  clearTimeout(prefetchTimer);
+  prefetchTimer = setTimeout(() => ensureStreets().catch(() => {}), 600);
+}
+
+// ---------- Distance visée ----------
+$('target').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const km = parseFloat(String($('target-km').value).replace(',', '.'));
+  const len = drawLengthMeters();
+  if (!km || km <= 0) return setStatus('Indique une distance en km.', true);
+  if (!len) return setStatus('Dessine d’abord quelque chose.', true);
+  const factor = (km * 1000) / (len * ROUTE_FACTOR);
+  const newSide = zoneSideMeters() * factor;
+  if (newSide > MAX_SIDE_M) return setStatus(`Trop grand pour ce dessin (zone max ${MAX_SIDE_M / 1000} km). Dessine une forme plus longue ou vise moins de km.`, true);
+  if (newSide < MIN_SIDE_M) return setStatus('Trop petit pour ce dessin.', true);
+  map.setZoom(map.getZoom() - Math.log2(factor), { animate: false });
+  zoneView = { center: map.getCenter(), zoom: map.getZoom() };
+  setStatus('');
+  updateZoneInfo();
+  restartPrefetch();
+});
 
 // ---------- Génération ----------
-let lastResult = null;
-const tick = () => new Promise((r) => setTimeout(r, 30));
-
-function setStatus(msg, error = false) {
-  const el = $('status');
-  el.textContent = msg;
-  el.classList.toggle('error', error);
+let busyJob = 0;
+function setBusy(text, sub) {
+  const b = $('busy');
+  if (text === false) { b.hidden = true; return; }
+  if (b.hidden && text === null) return;
+  b.hidden = false;
+  if (text) $('busy-text').textContent = text;
+  $('busy-sub').textContent = sub || '';
 }
-
-$('generate').onclick = async () => {
-  if (!strokes.some((s) => s.length >= 2)) return setStatus('Dessine quelque chose d’abord.', true);
-  const side = zoneSideMeters();
-  if (side > MAX_SIDE_M) return setStatus(`Zone trop grande (${fmtKm(side)}). Zoome un peu (max ${MAX_SIDE_M / 1000} km).`, true);
-  if (side < 300) return setStatus('Zone trop petite, dézoome un peu.', true);
-
-  const btn = $('generate');
-  btn.disabled = true;
-  try {
-    const center = map.containerPointToLatLng([box.left + box.side / 2, box.top + box.side / 2]);
-    const proj = makeProjection(center.lat, center.lng);
-    const toXY = ([u, v]) => {
-      const ll = map.containerPointToLatLng([box.left + u * box.side, box.top + v * box.side]);
-      return proj.toXY(ll.lat, ll.lng);
-    };
-    const strokesXY = strokes.filter((s) => s.length >= 2).map((s) => s.map(toXY));
-
-    const nw = map.containerPointToLatLng([box.left, box.top]);
-    const se = map.containerPointToLatLng([box.left + box.side, box.top + box.side]);
-    const padLat = (nw.lat - se.lat) * 0.25, padLon = (se.lng - nw.lng) * 0.25;
-
-    setStatus('Téléchargement des rues (OpenStreetMap)…');
-    await tick();
-    const osm = await fetchStreets(se.lat - padLat, nw.lng - padLon, nw.lat + padLat, se.lng + padLon);
-
-    setStatus('Construction du réseau…');
-    await tick();
-    const graph = buildGraph(osm, proj);
-    if (graph.mainSize < 20) throw new Error('Pas assez de rues dans cette zone.');
-    const index = new SpatialIndex(graph);
-
-    setStatus('Ajustement du dessin aux rues…');
-    await tick();
-    const t0 = performance.now();
-    const res = planRoute(graph, index, strokesXY, {
-      K: +$('opt-k').value,
-      fit: $('opt-fit').checked,
-      connect: $('opt-connect').checked,
-    });
-    if (!res.parts.length) throw new Error('Impossible de suivre ce dessin ici.');
-    lastResult = { res, graph, proj, connect: $('opt-connect').checked };
-    showResult(lastResult);
-    setStatus(`Calculé en ${((performance.now() - t0) / 1000).toFixed(1)} s · ${graph.mainSize.toLocaleString('fr')} intersections et points de rue.`);
-  } catch (err) {
-    console.error(err);
-    setStatus('Erreur : ' + (err.message || err), true);
-  } finally {
-    btn.disabled = false;
-  }
+$('cancel').onclick = () => {
+  busyJob++;
+  cancelStreets();
+  if (pending) { pending.reject(new DOMException('Annulé', 'AbortError')); pending = null; }
+  worker.terminate();
+  startWorker();
+  setBusy(false);
+  $('generate').disabled = false;
+  setStatus('Annulé.');
 };
 
-function showResult({ res, graph, proj }) {
-  resultLayer.clearLayers();
-  const ll = (nodes) => nodes.map((i) => [graph.lats[i], graph.lons[i]]);
-  for (const s of res.fittedStrokes) {
-    L.polyline(s.map(([x, y]) => proj.toLatLon(x, y)), { color: '#1c7ed6', weight: 3, opacity: 0.45 }).addTo(resultLayer);
+async function plan(strokesLL) {
+  const job = ++busyJob;
+  $('generate').disabled = true;
+  setBusy('Chargement des rues…', streets?.label?.replace('Rues : ', '') || '');
+  try {
+    const key = await ensureStreets();
+    if (job !== busyJob) return;
+    setBusy('Ajustement du dessin aux rues…', '');
+    const r = await callWorker({
+      type: 'plan', key, strokes: strokesLL,
+      opts: { K: +$('opt-k').value, fit: $('opt-fit').checked, connect: $('opt-connect').checked, fitMaxScale: $('target-km').value ? 0.03 : 0.15 },
+      targetM: parseFloat(String($('target-km').value).replace(',', '.')) * 1000 || 0,
+    });
+    if (job !== busyJob) return;
+    lastResult = { ...r, strokesLL, connect: $('opt-connect').checked };
+    goStep('result');
+  } catch (err) {
+    if (err.name !== 'AbortError' && job === busyJob) setStatus(err.message, true);
+  } finally {
+    if (job === busyJob) { setBusy(false); $('generate').disabled = false; }
   }
-  for (const p of res.parts) {
+}
+
+$('generate').onclick = () => {
+  const valid = strokes.filter((s) => s.length >= 2);
+  if (!valid.length) return setStatus('Dessine quelque chose d’abord (ou choisis une forme).', true);
+  const toLL = ([u, v]) => {
+    const ll = map.containerPointToLatLng([box.left + u * box.side, box.top + v * box.side]);
+    return [ll.lat, ll.lng];
+  };
+  plan(valid.map((s) => s.map(toLL)));
+};
+
+$('opt-k').addEventListener('change', () => { if (lastResult && step === 'result') plan(lastResult.strokesLL); });
+
+// ---------- Affichage du résultat ----------
+function drawResult(r) {
+  resultLayer.clearLayers();
+  for (const s of r.fitted) L.polyline(s, { color: '#1c7ed6', weight: 3, opacity: 0.45 }).addTo(resultLayer);
+  const all = [];
+  for (const p of r.parts) {
     const style = p.type === 'link'
       ? { color: '#868e96', weight: 4, opacity: 0.9, dashArray: '6 8' }
       : { color: '#e8590c', weight: 5, opacity: 0.95 };
-    L.polyline(ll(p.nodes), style).addTo(resultLayer);
+    L.polyline(p.coords, style).addTo(resultLayer);
+    all.push(...p.coords);
   }
-  const first = res.parts[0].nodes[0];
-  L.circleMarker([graph.lats[first], graph.lons[first]], { radius: 7, color: '#fff', weight: 2, fillColor: '#2b8a3e', fillOpacity: 1 })
-    .bindTooltip('Départ').addTo(resultLayer);
+  // Bornes kilométriques.
+  let acc = 0, nextKm = 1000;
+  for (let i = 1; i < all.length; i++) {
+    const d = map.distance(all[i - 1], all[i]);
+    while (acc + d >= nextKm) {
+      const t = (nextKm - acc) / d;
+      const pt = [all[i - 1][0] + t * (all[i][0] - all[i - 1][0]), all[i - 1][1] + t * (all[i][1] - all[i - 1][1])];
+      L.marker(pt, { interactive: false, icon: L.divIcon({ className: 'km-marker', html: String(nextKm / 1000), iconSize: [22, 18] }) }).addTo(resultLayer);
+      nextKm += 1000;
+    }
+    acc += d;
+  }
+  const start = all[0], end = all[all.length - 1];
+  L.circleMarker(start, { radius: 8, color: '#fff', weight: 2, fillColor: '#2b8a3e', fillOpacity: 1 }).bindTooltip('Départ', { permanent: true, direction: 'top', offset: [0, -8] }).addTo(resultLayer);
+  if (map.distance(start, end) > 30)
+    L.circleMarker(end, { radius: 8, color: '#fff', weight: 2, fillColor: '#c92a2a', fillOpacity: 1 }).bindTooltip('Arrivée', { direction: 'top' }).addTo(resultLayer);
 
-  stencil.classList.add('hidden');
-  $('result').hidden = false;
-  $('res-length').textContent = fmtKm(res.length);
-  $('res-dev').textContent = Math.round(res.deviation) + ' m';
-  $('res-fit').textContent = res.fit
-    ? `Ajustement : taille ×${res.fit.params.s.toFixed(2)}, rotation ${Math.round(res.fit.params.thDeg)}°.`
+  $('res-length').textContent = fmtKm(r.length);
+  $('res-dev').textContent = Math.round(r.deviation) + ' m';
+  $('res-fit').textContent = r.fit && (Math.abs(r.fit.s - 1) > 0.01 || Math.abs(r.fit.thDeg) >= 1)
+    ? `Dessin ajusté : taille ×${r.fit.s.toFixed(2).replace('.', ',')}, rotation ${Math.round(r.fit.thDeg)}°.`
     : '';
 }
 
-$('edit').onclick = () => {
-  resultLayer.clearLayers();
-  stencil.classList.remove('hidden');
-  $('result').hidden = true;
-  setStatus('');
-};
-
 $('download').onclick = () => {
   if (!lastResult) return;
-  const { res, graph, connect } = lastResult;
-  const ll = (nodes) => nodes.map((i) => [graph.lats[i], graph.lons[i]]);
+  const { parts, connect } = lastResult;
   let segments;
   if (connect) {
     const all = [];
-    for (const p of res.parts) for (const pt of ll(p.nodes)) {
+    for (const p of parts) for (const pt of p.coords) {
       const last = all[all.length - 1];
       if (!last || last[0] !== pt[0] || last[1] !== pt[1]) all.push(pt);
     }
     segments = [all];
   } else {
-    segments = res.parts.filter((p) => p.type === 'stroke').map((p) => ll(p.nodes));
+    segments = parts.filter((p) => p.type === 'stroke').map((p) => p.coords);
   }
   const blob = new Blob([toGPX(segments, 'RunDraw ' + new Date().toLocaleDateString('fr'))], { type: 'application/gpx+xml' });
   const a = document.createElement('a');
@@ -305,3 +436,7 @@ $('download').onclick = () => {
   a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 };
+
+// ---------- Démarrage ----------
+layoutStencil();
+goStep('zone');
