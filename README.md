@@ -42,7 +42,7 @@ node test/dense.mjs       # temps de calcul sur un réseau dense (~40 000 points
   interrogés en décalé (le premier qui répond gagne) et le résultat est mis en cache 14 jours.
 - `src/worker.js` : le calcul tourne dans un Web Worker (interface fluide) et garde le
   graphe en mémoire pour les recalculs.
-- `src/graph.js` : à partir des les voies praticables à pied via l'API Overpass
+- `src/graph.js` : à partir des voies praticables à pied
   (exclut autoroutes, voies privées, `foot=no`), construit un graphe et ne garde que
   la plus grande composante connexe. Index spatial en grille.
 - `src/router.js` : le trait est rééchantillonné, des points de passage sont placés
